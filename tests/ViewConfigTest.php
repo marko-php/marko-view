@@ -13,7 +13,7 @@ function createDefaultViewConfigRepository(
     array $overrides = [],
 ): FakeConfigRepository {
     return new FakeConfigRepository(array_merge([
-        'view.cache_directory' => '/tmp/views',
+        'view.cache_directory' => 'storage/views',
         'view.auto_refresh' => true,
     ], $overrides));
 }
@@ -73,7 +73,7 @@ it('ViewConfig uses default config values', function (): void {
 
     $viewConfig = new ViewConfig($config);
 
-    expect($viewConfig->cacheDirectory())->toBe('/tmp/views')
+    expect($viewConfig->cacheDirectory())->toBe('storage/views')
         ->and($viewConfig->autoRefresh())->toBeTrue();
 });
 
@@ -101,6 +101,12 @@ it('keeps cache_directory as a shipped default', function (): void {
     $config = require dirname(__DIR__) . '/config/view.php';
 
     expect(array_key_exists('cache_directory', $config))->toBeTrue();
+});
+
+it('ships a project-relative cache_directory default instead of the world-shared /tmp/views', function (): void {
+    $config = require dirname(__DIR__) . '/config/view.php';
+
+    expect($config['cache_directory'])->toBe('storage/views');
 });
 
 it('keeps auto_refresh as a shipped default', function (): void {
