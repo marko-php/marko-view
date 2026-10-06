@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Marko\View;
 
+use Marko\View\Exceptions\InvalidTemplateException;
 use Marko\View\Exceptions\TemplateNotFoundException;
 
 interface TemplateResolverInterface
@@ -13,7 +14,7 @@ interface TemplateResolverInterface
      *
      * @param string $template Template name (e.g., 'blog::post/show')
      * @return string Absolute path to template file
-     * @throws TemplateNotFoundException When template cannot be found
+     * @throws InvalidTemplateException|TemplateNotFoundException
      */
     public function resolve(string $template): string;
 
@@ -23,6 +24,7 @@ interface TemplateResolverInterface
      *
      * @param string $template Template name
      * @return array<string> List of searched paths
+     * @throws InvalidTemplateException When the template name is unsafe
      */
     public function getSearchedPaths(string $template): array;
 }

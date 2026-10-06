@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Marko\Core\Module\ModuleManifest;
 use Marko\Core\Module\ModuleRepository;
 use Marko\Testing\Fake\FakeConfigRepository;
+use Marko\View\Exceptions\InvalidTemplateException;
 use Marko\View\Exceptions\TemplateNotFoundException;
 use Marko\View\ModuleTemplateResolver;
 use Marko\View\TemplateResolverInterface;
@@ -582,4 +583,143 @@ it('uses FakeConfigRepository in ModuleTemplateResolverTest', function (): void 
     $viewConfig = new ViewConfig($repo);
 
     expect($viewConfig->extension())->toBe('.latte');
+});
+
+describe('template name validation', function (): void {
+    beforeEach(function (): void {
+        $this->moduleDir = sys_get_temp_dir() . '/marko-test-' . bin2hex(random_bytes(8));
+        $this->outsideDir = sys_get_temp_dir() . '/marko-test-outside-' . bin2hex(random_bytes(8));
+        mkdir($this->moduleDir . '/resources/views/post', 0755, true);
+        mkdir($this->outsideDir, 0755, true);
+        file_put_contents($this->moduleDir . '/resources/views/post/show.latte', 'inside');
+        file_put_contents($this->outsideDir . '/evil.latte', '{php system("id")}');
+
+        $this->resolver = new ModuleTemplateResolver(
+            new ModuleRepository([
+                new ModuleManifest(
+                    name: 'vendor/blog',
+                    version: '1.0.0',
+                    path: $this->moduleDir,
+                    source: 'vendor',
+                ),
+            ]),
+            createTestViewConfig(),
+        );
+    });
+
+    afterEach(function (): void {
+        foreach ([$this->moduleDir, $this->outsideDir] as $dir) {
+            $items = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::CHILD_FIRST,
+            );
+
+            foreach ($items as $item) {
+                if ($item->isDir() && !$item->isLink()) {
+                    rmdir($item->getPathname());
+                } else {
+                    unlink($item->getPathname());
+                }
+            }
+
+            rmdir($dir);
+        }
+    });
+
+    it('rejects a module-prefixed template name that traverses out with ../', function (): void {
+        $relative = '../../../' . basename($this->outsideDir) . '/evil';
+
+        // Without validation this would resolve to the planted evil.latte outside the module
+        expect(file_exists($this->moduleDir . '/resources/views/' . $relative . '.latte'))->toBeTrue()
+            ->and(fn () => $this->resolver->resolve('blog::' . $relative))
+            ->toThrow(InvalidTemplateException::class, "Invalid template name 'blog::$relative'");
+    });
+
+    it('rejects an unprefixed template name that traverses out with ../', function (): void {
+        expect(fn () => $this->resolver->resolve('post/../../../../etc/passwd'))
+            ->toThrow(InvalidTemplateException::class, "contains a '..' path segment");
+    });
+
+    it('rejects traversal in getSearchedPaths too', function (): void {
+        expect(fn () => $this->resolver->getSearchedPaths('blog::../secrets'))
+            ->toThrow(InvalidTemplateException::class);
+    });
+
+    it('rejects absolute template paths', function (): void {
+        expect(fn () => $this->resolver->resolve('blog::' . $this->outsideDir . '/evil'))
+            ->toThrow(InvalidTemplateException::class, 'absolute paths are not allowed')
+            ->and(fn () => $this->resolver->resolve('/etc/passwd'))
+            ->toThrow(InvalidTemplateException::class, 'absolute paths are not allowed');
+    });
+
+    it('rejects template names containing a NUL byte', function (): void {
+        expect(fn () => $this->resolver->resolve("blog::post/show\0.php"))
+            ->toThrow(InvalidTemplateException::class, 'contains a NUL byte');
+    });
+
+    it('rejects template names containing a backslash', function (): void {
+        expect(fn () => $this->resolver->resolve('blog::..\\..\\evil'))
+            ->toThrow(InvalidTemplateException::class, 'contains a backslash');
+    });
+
+    it('rejects template names with characters outside the allowed set', function (): void {
+        expect(fn () => $this->resolver->resolve('blog::post/show?x=1'))
+            ->toThrow(InvalidTemplateException::class, "the path segment 'show?x=1' contains characters")
+            ->and(fn () => $this->resolver->resolve('blog::post::show'))
+            ->toThrow(InvalidTemplateException::class)
+            ->and(fn () => $this->resolver->resolve('bl og::post/show'))
+            ->toThrow(InvalidTemplateException::class, "the module name 'bl og'");
+    });
+
+    it('rejects empty module names, empty paths, and empty or dot segments', function (): void {
+        expect(fn () => $this->resolver->resolve('::post/show'))
+            ->toThrow(InvalidTemplateException::class, "the module name ''")
+            ->and(fn () => $this->resolver->resolve('blog::'))
+            ->toThrow(InvalidTemplateException::class, 'the template path is empty')
+            ->and(fn () => $this->resolver->resolve('blog::post//show'))
+            ->toThrow(InvalidTemplateException::class, 'empty path segment')
+            ->and(fn () => $this->resolver->resolve('blog::post/./show'))
+            ->toThrow(InvalidTemplateException::class, "contains a '.' path segment");
+    });
+
+    it('rejects a template whose file is a symlink escaping the views directory', function (): void {
+        symlink($this->outsideDir . '/evil.latte', $this->moduleDir . '/resources/views/post/evil.latte');
+
+        expect(fn () => $this->resolver->resolve('blog::post/evil'))
+            ->toThrow(
+                InvalidTemplateException::class,
+                "Template 'blog::post/evil' resolves outside its module's views directory",
+            );
+    });
+
+    it('rejects a template reached through a symlinked directory escaping the views directory', function (): void {
+        symlink($this->outsideDir, $this->moduleDir . '/resources/views/linked');
+
+        expect(fn () => $this->resolver->resolve('blog::linked/evil'))
+            ->toThrow(InvalidTemplateException::class, 'resolves outside');
+    });
+
+    it('allows a symlink that stays inside the views directory', function (): void {
+        symlink(
+            $this->moduleDir . '/resources/views/post/show.latte',
+            $this->moduleDir . '/resources/views/post/alias.latte',
+        );
+
+        expect($this->resolver->resolve('blog::post/alias'))
+            ->toBe($this->moduleDir . '/resources/views/post/alias.latte');
+    });
+
+    it('resolves normal names with hyphens, underscores, dots and full module names', function (): void {
+        mkdir($this->moduleDir . '/resources/views/admin-area/sub_dir', 0755, true);
+        file_put_contents($this->moduleDir . '/resources/views/admin-area/sub_dir/email.html.latte', 'ok');
+
+        expect($this->resolver->resolve('blog::post/show'))
+            ->toBe($this->moduleDir . '/resources/views/post/show.latte')
+            ->and($this->resolver->resolve('vendor/blog::post/show'))
+            ->toBe($this->moduleDir . '/resources/views/post/show.latte')
+            ->and($this->resolver->resolve('post/show'))
+            ->toBe($this->moduleDir . '/resources/views/post/show.latte')
+            ->and($this->resolver->resolve('blog::admin-area/sub_dir/email.html'))
+            ->toBe($this->moduleDir . '/resources/views/admin-area/sub_dir/email.html.latte');
+    });
 });

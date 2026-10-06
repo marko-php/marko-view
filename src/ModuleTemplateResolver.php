@@ -6,71 +6,182 @@ namespace Marko\View;
 
 use Marko\Core\Module\ModuleManifest;
 use Marko\Core\Module\ModuleRepositoryInterface;
+use Marko\View\Exceptions\InvalidTemplateException;
 use Marko\View\Exceptions\TemplateNotFoundException;
 
 readonly class ModuleTemplateResolver implements TemplateResolverInterface
 {
+    private const string VIEWS_DIRECTORY = '/resources/views/';
+
+    private const string MODULE_NAME_PATTERN = '/^[A-Za-z0-9_.\-]+(?:\/[A-Za-z0-9_.\-]+)?$/';
+
+    private const string PATH_SEGMENT_PATTERN = '/^[A-Za-z0-9_.\-]+$/';
+
     public function __construct(
         private ModuleRepositoryInterface $moduleRepository,
         private ViewConfig $viewConfig,
     ) {}
 
     /**
-     * @throws TemplateNotFoundException
+     * @throws InvalidTemplateException|TemplateNotFoundException
      */
     public function resolve(
         string $template,
     ): string {
-        $searchedPaths = $this->getSearchedPaths($template);
+        $candidates = $this->getCandidates($template);
 
-        foreach ($searchedPaths as $path) {
+        foreach ($candidates as [$viewsDirectory, $path]) {
             if (file_exists($path)) {
+                $this->assertWithinViewsDirectory($template, $path, $viewsDirectory);
+
                 return $path;
             }
         }
 
-        throw TemplateNotFoundException::forTemplate($template, $searchedPaths);
+        throw TemplateNotFoundException::forTemplate(
+            $template,
+            array_column($candidates, 1),
+        );
     }
 
+    /**
+     * @throws InvalidTemplateException
+     */
     public function getSearchedPaths(
+        string $template,
+    ): array {
+        return array_column($this->getCandidates($template), 1);
+    }
+
+    /**
+     * Build the ordered list of candidate template files with the views directory each must stay inside.
+     *
+     * @return list<array{0: string, 1: string}> [viewsDirectory, path] pairs
+     * @throws InvalidTemplateException
+     */
+    private function getCandidates(
         string $template,
     ): array {
         [$moduleName, $templatePath] = $this->parseTemplate($template);
         $extension = $this->viewConfig->extension();
 
-        $paths = [];
+        $candidates = [];
 
-        $siblingPaths = [];
+        $siblingCandidates = [];
 
         foreach ($this->moduleRepository->all() as $module) {
+            $viewsDirectory = $module->path . self::VIEWS_DIRECTORY;
+            $candidate = [$viewsDirectory, $viewsDirectory . $templatePath . $extension];
+
             if ($this->matchesModuleName($module->name, $moduleName)) {
-                $paths[] = $module->path . '/resources/views/' . $templatePath . $extension;
+                $candidates[] = $candidate;
                 continue;
             }
 
             if ($this->matchesTemplatesFor($module, $moduleName)) {
-                $siblingPaths[] = $module->path . '/resources/views/' . $templatePath . $extension;
+                $siblingCandidates[] = $candidate;
             }
         }
 
-        return array_merge($paths, $siblingPaths);
+        return array_merge($candidates, $siblingCandidates);
     }
 
     /**
-     * Parse template name into module name and path.
+     * Parse and validate a template name into module name and path.
      *
      * @return array{0: string, 1: string} [moduleName, templatePath]
+     * @throws InvalidTemplateException
      */
     private function parseTemplate(
         string $template,
     ): array {
+        if (str_contains($template, "\0")) {
+            throw InvalidTemplateException::invalidName($template, 'it contains a NUL byte');
+        }
+
+        if (str_contains($template, '\\')) {
+            throw InvalidTemplateException::invalidName($template, 'it contains a backslash');
+        }
+
+        $moduleName = '';
+        $templatePath = $template;
+
         if (str_contains($template, '::')) {
             [$moduleName, $templatePath] = explode('::', $template, 2);
 
-            return [$moduleName, $templatePath];
+            if (preg_match(self::MODULE_NAME_PATTERN, $moduleName) !== 1) {
+                throw InvalidTemplateException::invalidName(
+                    $template,
+                    "the module name '$moduleName' is empty or contains characters outside [A-Za-z0-9_.-]",
+                );
+            }
         }
 
-        return ['', $template];
+        $this->validateTemplatePath($template, $templatePath);
+
+        return [$moduleName, $templatePath];
+    }
+
+    /**
+     * @throws InvalidTemplateException
+     */
+    private function validateTemplatePath(
+        string $template,
+        string $templatePath,
+    ): void {
+        if ($templatePath === '') {
+            throw InvalidTemplateException::invalidName($template, 'the template path is empty');
+        }
+
+        if (str_starts_with($templatePath, '/')) {
+            throw InvalidTemplateException::invalidName($template, 'absolute paths are not allowed');
+        }
+
+        foreach (explode('/', $templatePath) as $segment) {
+            if ($segment === '') {
+                throw InvalidTemplateException::invalidName($template, 'it contains an empty path segment');
+            }
+
+            if ($segment === '.' || $segment === '..') {
+                throw InvalidTemplateException::invalidName(
+                    $template,
+                    "it contains a '$segment' path segment",
+                );
+            }
+
+            if (preg_match(self::PATH_SEGMENT_PATTERN, $segment) !== 1) {
+                throw InvalidTemplateException::invalidName(
+                    $template,
+                    "the path segment '$segment' contains characters outside [A-Za-z0-9_.-]",
+                );
+            }
+        }
+    }
+
+    /**
+     * Guard against symlinks (or any other indirection) escaping the module's views directory.
+     *
+     * @throws InvalidTemplateException
+     */
+    private function assertWithinViewsDirectory(
+        string $template,
+        string $path,
+        string $viewsDirectory,
+    ): void {
+        $realPath = realpath($path);
+        $realViewsDirectory = realpath($viewsDirectory);
+
+        if (
+            $realPath === false
+            || $realViewsDirectory === false
+            || !str_starts_with($realPath, rtrim($realViewsDirectory, '/') . '/')
+        ) {
+            throw InvalidTemplateException::outsideViewsDirectory(
+                $template,
+                $realPath === false ? $path : $realPath,
+                $viewsDirectory,
+            );
+        }
     }
 
     /**
